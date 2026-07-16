@@ -11,7 +11,7 @@ import shutil
 from pathlib import Path
 from tarfile import TarFile
 
-import gitfourchette.pycompat  # noqa: F401 - Path.walk for Python 3.10, 3.11
+import gitfourchette.pycompat  # noqa: F401 - Path.walk & Path.exists(follow_symlinks=...) for Python 3.10, 3.11
 from gitfourchette import settings
 from gitfourchette.qt import *
 from gitfourchette.toolbox import withUniqueSuffix
@@ -22,6 +22,7 @@ logger = logging.getLogger(__name__)
 class Trash:
     DirectoryName = "trash"
     QDateTimeFormat = "yyyyMMdd-HHmmss"
+    MaxUniqueSuffix = 99
 
     _instance: Trash | None = None
 
@@ -35,7 +36,13 @@ class Trash:
         if not APP_TESTMODE:
             cacheDir = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.CacheLocation)
         else:
-            cacheDir = qTempDir()
+            # CacheLocation is common for all tests, but we don't want parallel
+            # tests to pollute each other's trashes. So, use the test-specific
+            # temporary directory. Put the trash into a subdirectory that needs
+            # to be created in order to simulate a fresh install where the cache
+            # directory doesn't exist yet.
+            cacheDir = Path(qTempDir(), "fake_cache_directory")
+
         self.trashDir = Path(cacheDir, Trash.DirectoryName)
         self.trashFiles = []
         self.refreshFiles()
@@ -70,16 +77,21 @@ class Trash:
     def exists(self) -> bool:
         return self.trashDir.is_dir()
 
+    def pathIsTrashManaged(self, p: Path) -> bool:
+        if not p.is_relative_to(self.trashDir):
+            return False
+        return p.is_file(follow_symlinks=False) or p.is_symlink()
+
     def refreshFiles(self):
         self.trashFiles.clear()
         if self.exists():
-            self.trashFiles.extend(p for p in self.trashDir.iterdir() if p.is_file())
+            self.trashFiles.extend(p for p in self.trashDir.iterdir() if self.pathIsTrashManaged(p))
             self.trashFiles.sort(reverse=True)
 
     def makeRoom(self, maxFiles: int):
         while len(self.trashFiles) > maxFiles:
             f = self.trashFiles.pop()
-            if f.is_file():
+            if self.pathIsTrashManaged(f):
                 logger.debug(f"Deleting trash file {f}")
                 f.unlink()
 
@@ -89,7 +101,7 @@ class Trash:
         maxFiles = max(0, self.maxFileCount() - 1)
         self.makeRoom(maxFiles)
 
-        self.trashDir.mkdir(exist_ok=True)
+        self.trashDir.mkdir(parents=True, exist_ok=True)
 
         now = QDateTime.currentDateTime().toString(Trash.QDateTimeFormat)
         wdID = Path(workdir).name
@@ -100,11 +112,15 @@ class Trash:
         uniqueName = withUniqueSuffix(
             stem,
             ext=ext,
-            reserved=lambda candidate: Path(self.trashDir, candidate).exists(),
-            stop=99,
+            reserved=lambda candidate: Path(self.trashDir, candidate).exists(follow_symlinks=False),
+            stop=Trash.MaxUniqueSuffix,
             suffixFormat="({})")
 
         path = Path(self.trashDir, uniqueName)
+
+        # Replace existing file if withUniqueSuffix ran out of suffixes
+        path.unlink(missing_ok=True)
+
         self.trashFiles.insert(0, path)
         return path
 
@@ -162,11 +178,14 @@ class Trash:
         count = 0
 
         for f in self.trashFiles:
-            if f.is_file():
+            if self.pathIsTrashManaged(f):
                 size += f.lstat().st_size
                 count += 1
 
         return size, count
+
+    def count(self) -> int:
+        return self.size()[1]
 
     def clear(self):
         self.makeRoom(0)

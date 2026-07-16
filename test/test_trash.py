@@ -15,10 +15,17 @@ def _fillTrashWithJunk(n):
     trash = Trash.instance()
     trash.refreshFiles()
     trash.clear()
-    os.makedirs(trash.trashDir, exist_ok=True)
+    trash.trashDir.mkdir(parents=True, exist_ok=True)
+
     for i in range(n):
-        with open(F"{trash.trashDir}/19991231T235900-test{i}.txt", "w") as junk:
-            junk.write(F"test{i}")
+        junkPath = Path(trash.trashDir, f"19991231T235900-test{i}.txt")
+
+        # Alternate between bogus text files and bogus symlinks
+        if i % 2 == 0:
+            junkPath.write_text(f"test{i}")
+        else:
+            junkPath.symlink_to(trash.trashDir)
+
     trash.refreshFiles()
 
 
@@ -109,17 +116,53 @@ def testTrashFull(tempDir, mainWindow):
     # Trash should have been purged to make room for new patch
     trashInstance = Trash.instance()
     assert len(trashInstance.trashFiles) == settings.prefs.maxTrashFiles
+    assert len(list(trashInstance.trashDir.iterdir())) == settings.prefs.maxTrashFiles
     assert "a1.txt" in trashInstance.trashFiles[0].name
 
 
 def testClearTrash(mainWindow):
-    assert Trash.instance().size()[1] == 0
+    trashInstance = Trash.instance()
+    assert trashInstance.count() == 0
 
     mainWindow.clearRescueFolder()
     acceptQMessageBox(mainWindow, "no discarded (patches|changes) to delete")
 
     _fillTrashWithJunk(40)
-    assert Trash.instance().size()[1] == 40
+    assert trashInstance.count() == 40
     mainWindow.clearRescueFolder()
     acceptQMessageBox(mainWindow, "delete.+40.+discarded (patches|changes)")
-    assert Trash.instance().size()[1] == 0
+    assert trashInstance.count() == 0
+
+    trashInstance.refreshFiles()
+    assert trashInstance.count() == 0
+    assert not list(trashInstance.trashDir.iterdir())
+
+
+def testOpenTrashFolder(mainWindow):
+    # Attempt to open trash without any files in it
+    triggerMenuAction(mainWindow.menuBar(), "help/open trash")
+    rejectQMessageBox(mainWindow, "there.s no trash folder")
+
+    # Open trash with some files
+    _fillTrashWithJunk(40)
+    with MockDesktopServicesContext(mainWindow) as services:
+        triggerMenuAction(mainWindow.menuBar(), "help/open trash")
+        openedPath = services.lastUrlAsLocalFile()
+        assert Trash.instance().trashDir.samefile(openedPath)
+
+
+def testTrashSymlinkNameConflicts(mainWindow, tempDir):
+    wd = tempDir.name
+    trash = Trash.instance()
+
+    from gitfourchette import settings
+    settings.prefs.maxTrashFiles = max(300, settings.prefs.maxTrashFiles)
+
+    assert trash.maxFileCount() >= 300
+    assert trash.MaxUniqueSuffix < trash.maxFileCount()
+
+    Path(wd, "trashed_symlink").symlink_to(Path(wd, "nowhere"))
+
+    # Saturate trash with symlinks
+    while trash.count() < trash.maxFileCount():
+        trash.backupFile(wd, "trashed_symlink")
